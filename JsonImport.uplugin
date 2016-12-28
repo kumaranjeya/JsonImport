@@ -12,7 +12,7 @@
 	"SupportURL": "",
 	"Modules": [
 		{
-			"Name": "JsonImportPlugin",
+			"Name": "JsonImport",
 			"Type": "EditorNoCommandlet",
 			"LoadingPhase": "Default"
 		}

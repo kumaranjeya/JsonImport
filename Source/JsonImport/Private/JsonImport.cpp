@@ -40,6 +40,7 @@ using JsonReaderRef = TSharedRef<TJsonReader<>>;
 using JsonObjPtrs = TArray<JsonObjPtr>;
 using JsonValPtrs = TArray<JsonValPtr>;
 using IdNameMap = TMap<int, FString>;
+using IdSet = TSet<int>;
 
 class JsonImporter{
 protected:
@@ -50,11 +51,23 @@ protected:
 	IdNameMap texIdMap;
 	IdNameMap matIdMap;
 	IdNameMap objectFolderPaths;
+	IdSet emissiveMaterials;
 
 	UMaterialExpression* createMaterialInput(UMaterial *material, int32 matTextureId, 
 		const FLinearColor *matColor, FExpressionInput &matInput, bool normalMap, UMaterialExpressionTextureSample ** outTexNode = 0,
 		UMaterialExpressionVectorParameter **outVecParameter = 0);
+	UMaterialExpression* createMaterialInputMultiply(UMaterial *material, int32 matTextureId, 
+		const FLinearColor *matColor, FExpressionInput &matInput, UMaterialExpressionTextureSample ** outTexNode = 0,
+		UMaterialExpressionVectorParameter **outVecParameter = 0);
 	UMaterialExpression* createMaterialSingleInput(UMaterial *material, float value, FExpressionInput &matInput);
+	UMaterialExpressionTextureSample *createTextureExpression(UMaterial *material, int32 matTextureId, bool normalMap = false);
+	UMaterialExpressionVectorParameter *createVectorExpression(UMaterial *material, FLinearColor color);
+	UMaterialExpressionConstant* createConstantExpression(UMaterial *material, float value);
+	template<typename Exp> Exp* createExpression(UMaterial *material){
+		Exp* result = NewObject<Exp>(material);
+		material->Expressions.Add(result);
+		return result;
+	}
 public:
 	UTexture* loadTexture(int32 id);
 	UMaterial* loadMaterial(int32 id);
@@ -404,12 +417,89 @@ public:
 	}
 };
 
+UMaterialExpressionConstant* createConstantExpression(UMaterial *material, float value){
+	auto matConstant = NewObject<UMaterialExpressionConstant>(material);
+	material->Expressions.Add(matConstant);
+	matConstant->R = value;
+	return matConstant;
+}
+
 UMaterialExpression* JsonImporter::createMaterialSingleInput(UMaterial *unrealMaterial, float value, FExpressionInput &matInput){
 	auto matConstant = NewObject<UMaterialExpressionConstant>(unrealMaterial);
 	unrealMaterial->Expressions.Add(matConstant);
 	matConstant->R = value;
 	matInput.Expression = matConstant;
 	return matConstant;
+}
+
+UMaterialExpressionVectorParameter* JsonImporter::createVectorExpression(UMaterial *material, FLinearColor color){
+	UMaterialExpressionVectorParameter* vecExpression = 
+		NewObject<UMaterialExpressionVectorParameter>(material);
+	material->Expressions.Add(vecExpression);
+
+	//matInput.Expression = vecExpression;
+	vecExpression->DefaultValue.R = color.R;
+	vecExpression->DefaultValue.G = color.G;
+	vecExpression->DefaultValue.B = color.B;
+	vecExpression->DefaultValue.A = color.A;
+	return vecExpression;
+}
+
+UMaterialExpressionTextureSample* JsonImporter::createTextureExpression(UMaterial *material, int32 matTextureId, bool normalMap){
+	UMaterialExpressionTextureSample *result = 0;
+	UE_LOG(JsonLog, Log, TEXT("Creating texture sample expression"));
+
+	logValue(TEXT("texId: "), matTextureId);
+	auto unrealTex = loadTexture(matTextureId);
+
+	if (!unrealTex){
+		UE_LOG(JsonLog, Warning, TEXT("Texture not found"));
+	}
+	result = NewObject<UMaterialExpressionTextureSample>(material);
+	result->SamplerType = normalMap ? SAMPLERTYPE_Normal: SAMPLERTYPE_Color;
+	material->Expressions.Add(result);
+	result->Texture = unrealTex;
+
+	return result;
+}
+
+UMaterialExpression* JsonImporter::createMaterialInputMultiply(UMaterial *material, int32 matTextureId, 
+		const FLinearColor *matColor, FExpressionInput &matInput, UMaterialExpressionTextureSample ** outTexNode,
+		UMaterialExpressionVectorParameter **outVecParameter){
+	UE_LOG(JsonLog, Log, TEXT("Creating multiply material input"));
+	UMaterialExpressionTextureSample *texExp = 0;
+	UMaterialExpressionVectorParameter *vecExp = 0;
+	bool hasTex = matTextureId >= 0;
+	if (hasTex){
+		texExp = createTextureExpression(material, matTextureId);
+		if (outTexNode)
+			*outTexNode = texExp;
+	}
+	if (matColor && ((*matColor != FLinearColor(1.0f, 1.0f, 1.0f, 1.0f)) || !hasTex)){
+		vecExp = createVectorExpression(material, *matColor);
+		if (outVecParameter)
+			*outVecParameter = vecExp;
+	}
+
+	UMaterialExpression* result = 0;
+	if (vecExp && texExp){
+		auto mulExp = createExpression<UMaterialExpressionMultiply>(material);
+		mulExp->A.Expression = texExp;
+		mulExp->B.Expression = vecExp;
+		result = mulExp;
+	}
+	else if (vecExp){
+		result = vecExp;
+	}
+	else if (texExp){
+		result = texExp;
+	}
+
+	if (result){
+		matInput.Expression = result;
+	}
+
+	return result;
 }
 
 UMaterialExpression* JsonImporter::createMaterialInput(UMaterial *unrealMaterial, int32 matTextureId, const FLinearColor *matColor, FExpressionInput &matInput, bool normalMap, 
@@ -555,6 +645,7 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 	FLinearColor lightColor;
 	float lightBounceIntensity = 0.0f;
 	FString lightRenderMode;
+	FString lightShadows;
 
 	if (lightArray.Num() > 0){
 		auto lightVal= lightArray[0];
@@ -569,6 +660,8 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 			lightBounceIntensity = getFloat(lightObj, "bounceIntensity");
 			lightColor = getColor(lightObj, "color");
 			lightRenderMode = getString(lightObj, "renderMode");
+			lightShadows = getString(lightObj, "shadows");
+			lightCastShadow = lightShadows != "Off";
 		}
 	}
 
@@ -587,10 +680,13 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 	auto world = GEditor->GetEditorWorldContext().World();
 	if (!world){
 		UE_LOG(JsonLog, Warning, TEXT("No world"));
-		return;
+		return; 
 	}
 
+	const float ueAttenuationBoost = 2.0f;
+
 	if (hasLight){
+		UE_LOG(JsonLog, Log, TEXT("Creating light"));
 		FActorSpawnParameters spawnParams;
 		FTransform transform;
 		FVector lightX, lightY, lightZ;
@@ -614,10 +710,17 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 					actor->SetFolderPath(FName(*folderPath));
 
 				auto light = actor->PointLightComponent;
-				light->SetIntensity(lightIntensity * 2500.0f);//100W lamp per 1 point of intensity
+				//light->SetIntensity(lightIntensity * 2500.0f);//100W lamp per 1 point of intensity
+
+				light->SetIntensity(lightIntensity);
+				light->bUseInverseSquaredFalloff = false;
+				//light->LightFalloffExponent = 2.0f;
+				light->SetLightFalloffExponent(2.0f);
+
 				light->SetLightColor(lightColor);
-				light->AttenuationRadius = lightRange*100.0f;
-				light->SetAttenuationRadius(lightRange*100.0f);
+				float attenRadius = lightRange*100.0f;//*ueAttenuationBoost;//those are fine
+				light->AttenuationRadius = attenRadius;
+				light->SetAttenuationRadius(attenRadius);
 				light->CastShadows = lightCastShadow;// != FString("None");
 				//light->SetVisibility(params.visible);
 				if (isStatic)
@@ -637,12 +740,20 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 					actor->SetFolderPath(FName(*folderPath));
 
 				auto light = actor->SpotLightComponent;
-				light->SetIntensity(lightIntensity * 2500.0f);//100W lamp per 1 point of intensity
+				//light->SetIntensity(lightIntensity * 2500.0f);//100W lamp per 1 point of intensity
+				light->SetIntensity(lightIntensity);
+				light->bUseInverseSquaredFalloff = false;
+				//light->LightFalloffExponent = 2.0f;
+				light->SetLightFalloffExponent(2.0f);
+
+
 				light->SetLightColor(lightColor);
-				light->AttenuationRadius = lightRange*100.0f;
-				light->SetAttenuationRadius(lightRange*100.0f);
+				float attenRadius = lightRange*100.0f;//*ueAttenuationBoost;
+				light->AttenuationRadius = attenRadius;
+				light->SetAttenuationRadius(attenRadius);
 				light->CastShadows = lightCastShadow;// != FString("None");
-				light->InnerConeAngle = lightSpotAngle * 0.25f;
+				//light->InnerConeAngle = lightSpotAngle * 0.25f;
+				light->InnerConeAngle = 0.0f;
 				light->OuterConeAngle = lightSpotAngle * 0.5f;
 				//light->SetVisibility(params.visible);
 				if (isStatic)
@@ -693,7 +804,6 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 	auto meshComp = worldMesh->GetStaticMeshComponent();
 	meshComp->StaticMesh = meshObject;
 
-
 	bool hasShadows = false;
 	bool twoSidedShadows = false;
 	bool hideInGame = false;
@@ -721,6 +831,24 @@ void JsonImporter::importObject(JsonObjPtr obj, int32 objId){
 
 	if (isStatic)
 		meshComp->SetMobility(EComponentMobility::Static);
+
+	if (meshObject){
+		bool emissiveMesh = false;
+		for(auto cur: meshObject->Materials){
+			auto mat = cur->GetMaterial();
+			if (!mat)
+				continue;
+			if (mat->EmissiveColor.IsConnected()){
+				emissiveMesh = true;
+				break;
+			}
+//			if (mat->
+			//cur->Emi
+		}
+		meshComp->LightmassSettings.bUseEmissiveForStaticLighting = emissiveMesh;
+	}
+	//meshComp->LightmassSettings
+
 
 	meshComp->SetCastShadow(hasShadows);
 	meshComp->bCastShadowAsTwoSided = twoSidedShadows;
@@ -1086,7 +1214,7 @@ void JsonImporter::importMaterial(JsonObjPtr obj, int32 matId){
 	UE_LOG(JsonLog, Log, TEXT("Creating albedo"));
 	UMaterialExpressionTextureSample *albedoTexExpression = 0;
 	UMaterialExpressionVectorParameter *albedoColorExpression = 0;
-	createMaterialInput(material, mainTexture, &color, material->BaseColor, false, &albedoTexExpression, &albedoColorExpression);
+	createMaterialInputMultiply(material, mainTexture, &color, material->BaseColor, &albedoTexExpression, &albedoColorExpression);
 	if (useNormalMap){
 		UE_LOG(JsonLog, Log, TEXT("Creating normal map"));
 		createMaterialInput(material, normalMapTex, nullptr, material->Normal, true);
@@ -1100,9 +1228,33 @@ void JsonImporter::importMaterial(JsonObjPtr obj, int32 matId){
 
 	createMaterialInput(material, occlusionTex, nullptr, material->AmbientOcclusion, false);
 
-	if (useEmission || (emissionTex >= 0)){
+	useEmission = useEmission || (emissionTex >= 0);
+	if (useEmission){
 		UE_LOG(JsonLog, Log, TEXT("Creating emissive"));
-		createMaterialInput(material, emissionTex, &emissionColor, material->EmissiveColor, false);
+
+		UMaterialExpressionTextureSample *emissiveTexExp = 0;
+
+		createMaterialInputMultiply(material, emissionTex, &emissionColor, material->EmissiveColor);
+		material->bUseEmissiveForDynamicAreaLighting = true;
+		/*
+		if (emissionTex >= 0){
+			emissiveTexExp = createTextureExpression(material, emissionTex, false);
+		}
+		auto emissiveColorExp = createVectorExpression(material, emissionColor);
+
+		if (emissiveTexExp){
+			auto mulExp = createExpression<UMaterialExpressionMultiply>(material);
+
+			mulExp->A.Expression = emissiveTexExp;
+			mulExp->B.Expression = emissiveTexExp;
+			material->EmissiveColor.Expression = mulExp;
+		}
+		else
+			material->EmissiveColor.Expression = emissiveColorExp;
+		*/
+		emissiveMaterials.Add(matId);
+
+		//createMaterialInput(material, emissionTex, &emissionColor, material->EmissiveColor, false);
 	}
 
 	if (useMetallic){
@@ -1124,6 +1276,11 @@ void JsonImporter::importMaterial(JsonObjPtr obj, int32 matId){
 
 	//if (useSpecular && (specTexExpression != nullptr) && (specTexExpression->Outputs.Num() == 5)){
 	//useSpecular is false? the heck..
+	//auto tmpNode1 = NewObject<UMaterialExpressionAdd>(material);
+	//material->Expressions.Add(tmpNode1);
+	//auto tmpNode2 = NewObject<UMaterialExpressionSubtract>(material);
+	//material->Expressions.Add(tmpNode2);
+
 	if ((specTexExpression != nullptr) && (specTexExpression->Outputs.Num() == 5)){
 		auto mulNode = NewObject<UMaterialExpressionMultiply>(material);
 		material->Expressions.Add(mulNode);
@@ -1151,7 +1308,13 @@ void JsonImporter::importMaterial(JsonObjPtr obj, int32 matId){
 	bool needsOpacity = (isTransparentQueue || isAlphaTestQueue) && !isGeomQueue;
 	if (needsOpacity){
 		auto &opacityTarget = isTransparentQueue ? material->Opacity: material->OpacityMask;
-		if (albedoTexExpression != 0)
+
+		if (albedoTexExpression && albedoColorExpression){
+			auto opacityMul = createExpression<UMaterialExpressionMultiply>(material);
+			albedoTexExpression->ConnectExpression(&opacityMul->A, 4);
+			albedoColorExpression->ConnectExpression(&opacityMul->B, 4);
+			opacityTarget.Expression = opacityMul;
+		}else if (albedoTexExpression != 0)
 			albedoTexExpression->ConnectExpression(&opacityTarget, 4);
 		else if (albedoColorExpression != 0)
 			albedoColorExpression->ConnectExpression(&opacityTarget, 4);
